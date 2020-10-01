@@ -191,6 +191,300 @@ impl<M: Message> MavFrame<M> {
     }
 }
 
+trait MavlinkPacketFormat {
+    fn checksum(&self) -> u16;
+
+    fn set_checksum(&mut self, value: u16);
+
+    fn calc_checksum<M: Message>(&self) -> u16;
+
+    fn update_checksum<M: Message>(&mut self) {
+        self.set_checksum(self.calc_checksum::<M>());
+    }
+
+    fn validate_checksum<M: Message>(&self) -> bool {
+        return self.checksum() == self.calc_checksum::<M>();
+    }
+}
+
+/// MAVLink V1 packet format: https://mavlink.io/en/guide/serialization.html#v1_packet_format
+struct MavlinkV1PacketFormat {
+    pub magic: u8,
+    pub len: u8,
+    pub seq: u8,
+    pub sysid: u8,
+    pub compid: u8,
+    pub msgid: u8,
+    pub payload: Vec<u8>,
+    pub checksum: u16,
+}
+
+impl Default for MavlinkV1PacketFormat {
+    fn default() -> Self {
+        MavlinkV1PacketFormat {
+            magic: MAV_STX,
+            ..Default::default()
+        }
+    }
+}
+
+impl MavlinkPacketFormat for MavlinkV1PacketFormat {
+    fn checksum(&self) -> u16 {
+        return self.checksum;
+    }
+
+    fn set_checksum(&mut self, value: u16){
+        self.checksum = value;
+    }
+
+    fn calc_checksum<M: Message>(&self) -> u16 {
+        let mut crc_calculator = CRCu16::crc16mcrf4cc();
+        crc_calculator.digest(&[self.len, self.seq, self.sysid, self.compid, self.msgid]);
+        crc_calculator.digest(&self.payload);
+        crc_calculator.digest(&[M::extra_crc(self.msgid.into())]);
+
+        return crc_calculator.get_crc();
+    }
+}
+
+/// MAVLink V2 packet format: https://mavlink.io/en/guide/serialization.html#mavlink2_packet_format
+struct MavlinkV2PacketFormat {
+    pub magic: u8,
+    pub len: u8,
+    pub incompat_flags: u8,
+    pub compat_flags: u8,
+    pub seq: u8,
+    pub sysid: u8,
+    pub compid: u8,
+    pub msgid: [u8; 3],
+    pub payload: Vec<u8>,
+    pub checksum: u16,
+    pub signature: [u8; 13],
+}
+
+impl Default for MavlinkV2PacketFormat {
+    fn default() -> Self {
+        MavlinkV2PacketFormat {
+            magic: MAV_STX_V2,
+            ..Default::default()
+        }
+    }
+}
+
+impl MavlinkPacketFormat for MavlinkV2PacketFormat {
+    fn checksum(&self) -> u16 {
+        return self.checksum;
+    }
+
+    fn set_checksum(&mut self, value: u16){
+        self.checksum = value;
+    }
+
+    fn calc_checksum<M: Message>(&self) -> u16 {
+        let mut crc_calculator = CRCu16::crc16mcrf4cc();
+        crc_calculator.digest(&[
+            self.len,
+            self.incompat_flags,
+            self.compat_flags,
+            self.seq,
+            self.sysid,
+            self.compid,
+        ]);
+        crc_calculator.digest(&self.msgid);
+        crc_calculator.digest(&self.payload);
+
+        let mut msgid_buffer = [0 as u8; 4];
+        msgid_buffer[..3].copy_from_slice(&self.msgid);
+        let msgid = u32::from_le_bytes(msgid_buffer);
+
+        crc_calculator.digest(&[M::extra_crc(msgid)]);
+        return crc_calculator.get_crc();
+    }
+}
+
+trait MavlinkParser {
+    fn version(&self) -> MavlinkVersion;
+
+    fn read<M: Message>(
+        &mut self,
+        buffer: &Vec<u8>
+    ) -> Result<(MavHeader, M), error::MessageReadError>;
+}
+
+enum MavlinkV1ParserState {
+    Magic,
+    Len,
+    Seq,
+    SysId,
+    CompId,
+    MsgId,
+    Payload,
+    Crc1,
+    Crc2,
+    Done,
+}
+
+struct MavlinkV1Parser {
+    format: MavlinkV1PacketFormat,
+    state: MavlinkV1ParserState,
+    payload_parsed: u8,
+}
+
+impl MavlinkV1Parser {
+    pub fn new() -> Self {
+        MavlinkV1Parser {
+            format: Default::default(),
+            state: MavlinkV1ParserState::Len,
+            payload_parsed: 0,
+        }
+    }
+}
+
+enum MavlinkV2ParserState {
+    Magic,
+    Len,
+    IncompatFlags,
+    CompatFlags,
+    Seq,
+    SysId,
+    CompId,
+    MsgId1,
+    MsgId2,
+    MsgId3,
+    Payload,
+    Crc1,
+    Crc2,
+    Signature,
+    Done,
+}
+
+struct MavlinkV2Parser {
+    format: MavlinkV2PacketFormat,
+    state: MavlinkV2ParserState,
+    payload_parsed: u8,
+    signature_parsed: u8,
+}
+
+impl Default for MavlinkV2Parser {
+    fn default() -> Self {
+        MavlinkV2Parser {
+            format: Default::default(),
+            state: MavlinkV2ParserState::Len,
+            payload_parsed: 0,
+            signature_parsed: 0,
+        }
+    }
+}
+
+impl MavlinkParser for MavlinkV1Parser {
+    fn version(&self) -> MavlinkVersion {
+        MavlinkVersion::V1
+    }
+
+    fn read<M: Message>(
+        &mut self,
+        buffer: &Vec<u8>,
+    ) -> Result<(MavHeader, M), error::MessageReadError> {
+        let mut counter = 0;
+        //TODO: move to iterator
+        let mut get = || -> Option<u8> {
+            let value = buffer.get(counter);
+            counter += 1;
+            return value;
+        };
+
+        loop {
+            /*
+            let mut buffer = [0; 1];
+            let size = match reader.read(&mut buffer) {
+                Ok(size) => size,
+                _ => {
+                    return Err(error::MessageReadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "No data avaiable.",
+                    )));
+                }
+            };*/
+            use MavlinkV1ParserState::*;
+            match self.state {
+                Magic => {
+                    if buffer[0] == self.format.magic {
+                        self.state = Len;
+                    }
+                }
+                Len => {
+                    self.format.len = buffer[0];
+                    self.format.payload = vec![0; self.format.len as usize];
+                    self.state = Seq;
+                }
+                Seq => {
+                    self.format.seq = buffer[0];
+                    self.state = SysId;
+                }
+                SysId => {
+                    self.format.sysid = buffer[0];
+                    self.state = CompId;
+                }
+                CompId => {
+                    self.format.compid = buffer[0];
+                    self.state = MsgId;
+                }
+                MsgId => {
+                    self.format.msgid = buffer[0];
+                    self.state = Payload;
+                }
+                Payload => {
+                    self.format.payload[self.payload_parsed as usize] = buffer[0];
+                    self.payload_parsed += 1;
+                    if self.payload_parsed == self.format.len {
+                        self.state = Crc1;
+                    }
+                }
+                Crc1 => {
+                    let mut value = self.format.checksum.to_le_bytes();
+                    value[0] = buffer[0];
+                    self.format.checksum = u16::from_le_bytes(value);
+                    self.state = Crc2;
+                }
+                Crc2 => {
+                    let mut value = self.format.checksum.to_le_bytes();
+                    value[1] = buffer[0];
+                    self.format.checksum = u16::from_le_bytes(value);
+                    self.state = Done;
+
+                    if self.format.validate_checksum::<M>() {
+                        return M::parse(
+                            self.version(),
+                            self.format.msgid as u32,
+                            &self.format.payload,
+                        )
+                        .map(|msg| {
+                            (
+                                MavHeader {
+                                    sequence: self.format.seq,
+                                    system_id: self.format.sysid,
+                                    component_id: self.format.compid,
+                                },
+                                msg,
+                            )
+                        })
+                        .map_err(|err| err.into());
+                    }
+
+                    return Err(error::MessageReadError::Parse(ParserError::WrongCrc {
+                        expected: self.format.calc_checksum::<M>(),
+                        received: self.format.checksum,
+                    }));
+                }
+                Done => {
+                    self.state = Magic;
+                }
+            }
+        }
+    }
+}
+
+/*
 pub fn read_versioned_msg<M: Message, R: Read>(
     r: &mut R,
     version: MavlinkVersion,
@@ -337,6 +631,7 @@ pub fn read_v2_msg<M: Message, R: Read>(
             .map_err(|err| err.into());
     }
 }
+*/
 
 /// Write a message using the given mavlink version
 pub fn write_versioned_msg<M: Message, W: Write>(
